@@ -12,8 +12,9 @@ __pycache__/
 *$py.class
 .mplconfig/
 
-# 생성된 차트 이미지
+# 생성된 차트 이미지 및 알림 상태 캐시
 *.png
+.alert_state.json
 
 # OS 파일
 .DS_Store

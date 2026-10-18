@@ -1,9 +1,12 @@
 import os
 import sys
+import json
 import warnings
+from datetime import datetime, timezone
 
 warnings.filterwarnings("ignore", message=".*OpenSSL.*")
-os.environ.setdefault("MPLCONFIGDIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".mplconfig"))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(BASE_DIR, ".mplconfig"))
 
 import ccxt
 import pandas as pd
@@ -20,133 +23,212 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 SYMBOL = "BTC/USDT:USDT"
-TIMEFRAME = "15m"
 LIMIT = 100
+STATE_FILE = os.path.join(BASE_DIR, ".alert_state.json")
+
+# 멀티 타임프레임 설정: (직전 20캔들 박스권 최대 변동폭 %, 타임프레임 길이(분), 새로 마감된 캔들 유효 시간(분))
+TIMEFRAMES = {
+    "5m":  {"max_box_pct": 1.2, "tf_minutes": 5,   "fresh_window_min": 15},
+    "15m": {"max_box_pct": 1.8, "tf_minutes": 15,  "fresh_window_min": 20},
+    "1h":  {"max_box_pct": 3.0, "tf_minutes": 60,  "fresh_window_min": 20},
+    "4h":  {"max_box_pct": 5.0, "tf_minutes": 240, "fresh_window_min": 20},
+}
 
 
-def fetch_market_data():
-    """Bitget 선물에서 BTC/USDT 15분봉 최근 100개, 현재가, 현재 펀딩비 조회"""
-    exchange = ccxt.bitget({'options': {'defaultType': 'swap'}})
+def load_alert_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
-    ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=LIMIT)
+
+def save_alert_state(state):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"[경고] 상태 파일 저장 실패: {e}")
+
+
+def init_exchange():
+    return ccxt.bitget({'options': {'defaultType': 'swap'}})
+
+
+def fetch_common_info(exchange):
+    """현재가 및 펀딩비 조회"""
     ticker = exchange.fetch_ticker(SYMBOL)
     current_price = float(ticker['last'])
 
-    # 펀딩비 조회 (소수점 형태 예: 0.0001 -> 0.0100%)
     funding_rate_pct = 0.0
     try:
         funding_info = exchange.fetch_funding_rate(SYMBOL)
         if funding_info and funding_info.get('fundingRate') is not None:
-            funding_rate_pct = float(funding_info['fundingRate']) * 100
+            funding_rate_pct = float(funding_info['fundingRate']) * 100.0
     except Exception as e:
         print(f"[경고] 펀딩비 조회 실패: {e}")
 
+    return current_price, funding_rate_pct
+
+
+def fetch_tf_dataframe(exchange, tf):
+    """타임프레임별 OHLCV 데이터 조회 및 VWAP / ATR(14) 계산"""
+    ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=tf, limit=LIMIT)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-    # UTC 시간 인덱스 (당일 VWAP 계산 기준) 및 KST 시간 컬럼
     df['UTC_Date'] = pd.to_datetime(df['timestamp'], unit='ms')
     df['Date'] = df['UTC_Date'] + pd.Timedelta(hours=9)  # KST
     df.set_index('Date', inplace=True)
 
-    return current_price, funding_rate_pct, df
-
-
-def calculate_indicators(df):
-    """
-    1. VWAP (당일 기준 - KST 일자 변경 기준 누적, pandas_ta 호환)
-    2. VWMA (길이 20)
-    3. RSI (길이 14)
-    4. 최근 100개 캔들 Swing High / Swing Low 기준 피보나치 되돌림 (0.382, 0.5, 0.618)
-    """
-    # pandas_ta VWAP (DatetimeIndex 정렬 기반 일별 리셋)
-    df['VWAP'] = ta.vwap(df['High'], df['Low'], df['Close'], df['Volume'])
-    if df['VWAP'].isna().all():
-        # Fallback: 당일 기준 수동 VWAP 계산
+    # 당일 기준 VWAP (4h 등 상위 프레임에서도 당일 또는 누적 VWAP 표시되도록 처리)
+    vwap_series = ta.vwap(df['High'], df['Low'], df['Close'], df['Volume'])
+    if vwap_series is None or vwap_series.isna().all():
         tp = (df['High'] + df['Low'] + df['Close']) / 3.0
         tp_vol = tp * df['Volume']
         day_group = df.index.date
-        df['VWAP'] = tp_vol.groupby(day_group).cumsum() / df['Volume'].groupby(day_group).cumsum()
+        vwap_series = tp_vol.groupby(day_group).cumsum() / df['Volume'].groupby(day_group).cumsum()
+    df['VWAP'] = vwap_series
 
-    # VWMA (길이 20)
-    df['VWMA_20'] = ta.vwma(df['Close'], df['Volume'], length=20)
-
-    # RSI (길이 14)
-    df['RSI_14'] = ta.rsi(df['Close'], length=14)
-
-    # 최근 100개 캔들 최고점(Swing High) / 최저점(Swing Low)
-    swing_high = float(df['High'].max())
-    swing_low = float(df['Low'].min())
-    diff = swing_high - swing_low
-
-    # 고점 대비 되돌림 레벨 계산:
-    # 0.382 되돌림 (상단 저항 측), 0.5 중심, 0.618 되돌림 (하단 지지 측)
-    fib_382 = swing_high - diff * 0.382
-    fib_500 = swing_high - diff * 0.500
-    fib_618 = swing_high - diff * 0.618
-
-    fib_levels = {
-        'swing_high': swing_high,
-        'swing_low': swing_low,
-        '0.382': fib_382,
-        '0.5': fib_500,
-        '0.618': fib_618,
-    }
-
-    return df, fib_levels
+    # ATR(14) 계산
+    df['ATR_14'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+    return df
 
 
-def evaluate_signals(current_price, df, fib_levels):
-    """타점 감지 조건 판별"""
-    latest = df.iloc[-1]
-    vwap = float(latest['VWAP'])
-    vwma20 = float(latest['VWMA_20'])
-    rsi14 = float(latest['RSI_14'])
+def analyze_breakout_at_index(df, target_pos, max_box_pct):
+    """
+    특정 캔들 위치(target_pos: -2 또는 -1)를 돌파 캔들로 두고,
+    그 직전 20개 캔들(돌파 캔들 제외)의 박스권 응축 여부, 거래량 폭발, 장대캔들 및 상/하향 돌파 판별
+    """
+    if target_pos == -1:
+        box_df = df.iloc[-21:-1]
+        atr_prev = float(df['ATR_14'].iloc[-2])
+    else:
+        box_df = df.iloc[-22:-2]
+        atr_prev = float(df['ATR_14'].iloc[-3])
 
-    fib_382 = fib_levels['0.382']
-    fib_500 = fib_levels['0.5']
-    fib_618 = fib_levels['0.618']
+    candle = df.iloc[target_pos]
 
-    # 1) 가격 조건
-    # 피보나치 0.5 ~ 0.618 구간 (fib_618 <= price <= fib_500)
-    in_long_fib = min(fib_500, fib_618) <= current_price <= max(fib_500, fib_618)
-    # 피보나치 0.382 ~ 0.5 구간 (fib_500 <= price <= fib_382)
-    in_short_fib = min(fib_382, fib_500) <= current_price <= max(fib_382, fib_500)
-    # VWAP 라인과 ±0.2% 이내 근접
-    vwap_diff_pct = abs(current_price - vwap) / vwap * 100.0
-    near_vwap = vwap_diff_pct <= 0.2
+    # 1) 박스권 응축 (돌파 직전 20개 캔들)
+    box_high = float(box_df['High'].max())
+    box_low = float(box_df['Low'].min())
+    box_pct = (box_high - box_low) / box_low * 100.0 if box_low > 0 else 999.0
+    is_squeeze = box_pct <= max_box_pct
 
-    # 2) 타점 결합 조건
-    long_price_ok = in_long_fib or near_vwap
-    long_rsi_ok = rsi14 <= 42.0
-    is_long = long_price_ok and long_rsi_ok
+    # 2) 거래량 폭발 (직전 20개 평균 거래량 대비 2.5배 = 250% 이상)
+    vol_sma20 = float(box_df['Volume'].mean())
+    candle_vol = float(candle['Volume'])
+    vol_ratio = (candle_vol / vol_sma20) if vol_sma20 > 0 else 0.0
+    vol_pct = vol_ratio * 100.0
+    is_vol_spike = vol_ratio >= 2.5
 
-    short_price_ok = in_short_fib or near_vwap
-    short_rsi_ok = rsi14 >= 58.0
-    is_short = short_price_ok and short_rsi_ok
+    # 3) 장대 캔들 (몸통 >= 직전 ATR(14) * 1.8 이고, 몸통/전체길이 >= 65%)
+    open_p = float(candle['Open'])
+    close_p = float(candle['Close'])
+    high_p = float(candle['High'])
+    low_p = float(candle['Low'])
+
+    body_size = abs(close_p - open_p)
+    full_range = high_p - low_p
+    body_ratio_pct = (body_size / full_range * 100.0) if full_range > 0 else 0.0
+    atr_ratio = (body_size / atr_prev) if atr_prev > 0 else 0.0
+
+    is_marubozu = (atr_ratio >= 1.8) and (body_ratio_pct >= 65.0)
+
+    # 4) 방향 및 박스권 돌파 여부
+    is_bull_break = (close_p > open_p) and (close_p > box_high)
+    is_bear_break = (close_p < open_p) and (close_p < box_low)
 
     signal = None
-    if is_long:
-        signal = "LONG"
-    elif is_short:
-        signal = "SHORT"
+    if is_squeeze and is_vol_spike and is_marubozu:
+        if is_bull_break:
+            signal = "LONG"
+        elif is_bear_break:
+            signal = "SHORT"
 
-    metrics = {
-        'current_price': current_price,
-        'vwap': vwap,
-        'vwma20': vwma20,
-        'rsi14': rsi14,
-        'vwap_diff_pct': vwap_diff_pct,
-        'in_long_fib': in_long_fib,
-        'in_short_fib': in_short_fib,
-        'near_vwap': near_vwap,
-        'long_rsi_ok': long_rsi_ok,
-        'short_rsi_ok': short_rsi_ok,
+    return {
+        "target_pos": target_pos,
+        "candle_ts": int(candle['timestamp']),
+        "candle_time_kst": df.index[target_pos].strftime('%Y-%m-%d %H:%M'),
+        "open": open_p,
+        "high": high_p,
+        "low": low_p,
+        "close": close_p,
+        "box_high": box_high,
+        "box_low": box_low,
+        "box_pct": box_pct,
+        "max_box_pct": max_box_pct,
+        "is_squeeze": is_squeeze,
+        "vol_sma20": vol_sma20,
+        "candle_vol": candle_vol,
+        "vol_ratio": vol_ratio,
+        "vol_pct": vol_pct,
+        "is_vol_spike": is_vol_spike,
+        "atr_prev": atr_prev,
+        "body_size": body_size,
+        "atr_ratio": atr_ratio,
+        "body_ratio_pct": body_ratio_pct,
+        "is_marubozu": is_marubozu,
+        "is_bull_break": is_bull_break,
+        "is_bear_break": is_bear_break,
+        "signal": signal,
     }
-    return signal, metrics
 
 
-def create_signal_chart(df, fib_levels, current_price, signal_label, filename="btc_signal_chart.png"):
-    """최근 80개 캔들 + VWAP + VWMA(20) + 피보나치 수평선이 그려진 차트 생성"""
-    plot_df = df.tail(80).copy()
+def evaluate_timeframe(df, tf, tf_cfg, state):
+    """
+    직전 완성 캔들(iloc[-2]) 우선 검사 + 현재 진행 캔들(iloc[-1])이 마감 1분 전 이내일 때 검사.
+    중복 알림 방지:
+      1) 로컬/캐시 .alert_state.json 에 이미 기록된 캔들 타임스탬프면 스킵
+      2) GitHub Actions(5분 주기) 무상태 환경을 위해, 완성 캔들(iloc[-2])이 마감된 지
+         fresh_window_min(예: 1h/4h봉은 마감 후 20분 이내)이 지났으면 중복 발송하지 않음
+    """
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    tf_ms = tf_cfg["tf_minutes"] * 60 * 1000
+    fresh_ms = tf_cfg["fresh_window_min"] * 60 * 1000
+
+    # 기본 분석은 직전 마감 완성 캔들(iloc[-2])
+    res_closed = analyze_breakout_at_index(df, -2, tf_cfg["max_box_pct"])
+    closed_end_ms = res_closed["candle_ts"] + tf_ms
+    closed_age_min = (now_ms - closed_end_ms) / 60000.0
+    res_closed["candle_type"] = "완성봉(iloc[-2])"
+
+    # 현재 캔들(iloc[-1]) 마감까지 남은 시간 계산
+    res_curr = analyze_breakout_at_index(df, -1, tf_cfg["max_box_pct"])
+    curr_end_ms = res_curr["candle_ts"] + tf_ms
+    rem_min = (curr_end_ms - now_ms) / 60000.0
+    res_curr["candle_type"] = f"마감임박봉(iloc[-1], 잔여 {max(0.0, rem_min):.1f}분)"
+
+    chosen = res_closed
+    already_sent = False
+
+    # 1) 완성봉(iloc[-2])에서 시그널이 발생했고, 최근 마감된 신선한 캔들인 경우
+    if res_closed["signal"] is not None:
+        if (now_ms - closed_end_ms) <= fresh_ms and state.get(tf) != res_closed["candle_ts"]:
+            chosen = res_closed
+        else:
+            already_sent = True
+            chosen = res_closed
+
+    # 2) 완성봉 시그널이 없을 때, 현재 캔들(iloc[-1])이 마감 1분 전 이내이면서 강하게 조건을 돌파한 경우
+    elif 0 <= rem_min <= 1.0 and res_curr["signal"] is not None:
+        if state.get(tf) != res_curr["candle_ts"]:
+            chosen = res_curr
+        else:
+            already_sent = True
+            chosen = res_curr
+
+    chosen["already_sent"] = already_sent
+    chosen["rem_min_curr"] = rem_min
+    return chosen
+
+
+def create_breakout_chart(df, tf, eval_res, current_price, filename=None):
+    """최근 60개 캔들 + 거래량 바 + 박스권 상/하단 수평선(점선) + VWAP 차트 생성"""
+    if filename is None:
+        filename = f"btc_breakout_{tf}.png"
+
+    plot_df = df.tail(60).copy()
 
     mc = mpf.make_marketcolors(up='#26a69a', down='#ef5350', inherit=True)
     style = mpf.make_mpf_style(
@@ -157,22 +239,16 @@ def create_signal_chart(df, fib_levels, current_price, signal_label, filename="b
     )
 
     apds = [
-        mpf.make_addplot(plot_df['VWAP'], color='#ffeb3b', width=1.6, label='VWAP'),
-        mpf.make_addplot(plot_df['VWMA_20'], color='#29b6f6', width=1.2, linestyle='dotted', label='VWMA(20)'),
+        mpf.make_addplot(plot_df['VWAP'], color='#ffeb3b', width=1.5, label='VWAP'),
     ]
 
-    hlines_vals = [
-        fib_levels['swing_high'],
-        fib_levels['0.382'],
-        fib_levels['0.5'],
-        fib_levels['0.618'],
-        fib_levels['swing_low'],
-    ]
-    hlines_colors = ['#ef5350', '#ff9800', '#e040fb', '#00e676', '#26a69a']
+    hlines_vals = [eval_res['box_high'], eval_res['box_low']]
+    hlines_colors = ['#00e676', '#ff5252']
 
+    sig_text = eval_res['signal'] if eval_res['signal'] else "BRIEFING"
     title = (
-        f"Bitget BTC/USDT 15m [{signal_label}] | Price: ${current_price:,.1f} | "
-        f"VWAP: ${plot_df['VWAP'].iloc[-1]:,.1f} | RSI: {plot_df['RSI_14'].iloc[-1]:.1f}"
+        f"Bitget BTC/USDT [{tf} {sig_text}] | Price: ${current_price:,.1f} | "
+        f"Box: {eval_res['box_pct']:.2f}% | Vol: {eval_res['vol_pct']:.0f}%"
     )
 
     mpf.plot(
@@ -180,7 +256,7 @@ def create_signal_chart(df, fib_levels, current_price, signal_label, filename="b
         type='candle',
         volume=True,
         addplot=apds,
-        hlines=dict(hlines=hlines_vals, colors=hlines_colors, linestyle='--', linewidths=1.0),
+        hlines=dict(hlines=hlines_vals, colors=hlines_colors, linestyle='--', linewidths=1.3),
         style=style,
         title=title,
         savefig=dict(fname=filename, dpi=150, bbox_inches='tight'),
@@ -189,51 +265,39 @@ def create_signal_chart(df, fib_levels, current_price, signal_label, filename="b
     return filename
 
 
-def build_message(signal, metrics, fib_levels, funding_rate_pct, force_mode=False):
-    """요청된 포맷에 맞춘 텔레그램 알림 메시지 생성"""
-    price = metrics['current_price']
-    vwap = metrics['vwap']
-    rsi = metrics['rsi14']
-
-    # 실제 시그널이 없으면(강제 테스트 브리핑 시) 현재 RSI가 어느 쪽에 가까운지 기준으로 예시 방향 설정
-    effective_dir = signal if signal else ("LONG" if rsi < 50 else "SHORT")
-
-    if signal == "LONG":
-        header = "🚨 <b>[BTC 15m 타점 포착: 🟢 LONG]</b>"
-    elif signal == "SHORT":
-        header = "🚨 <b>[BTC 15m 타점 포착: 🔴 SHORT]</b>"
+def build_breakout_message(tf, eval_res, current_price, funding_rate_pct, force_mode=False):
+    """요청된 포맷에 맞춘 텔레그램 돌파 알림 메시지 생성"""
+    sig = eval_res["signal"]
+    if sig is None:
+        effective_dir = "LONG" if eval_res["close"] >= eval_res["open"] else "SHORT"
     else:
-        header = f"🚨 <b>[BTC 15m 타점 포착: {effective_dir} (강제 브리핑 테스트)]</b>"
+        effective_dir = sig
 
     if effective_dir == "LONG":
-        fib_line = f"피보나치 구간: 0.5(${fib_levels['0.5']:,.0f}) ~ 0.618(${fib_levels['0.618']:,.0f})"
-        stop_price = fib_levels['swing_low']
-        stop_label = "직전 스윙 로우"
-        stop_pct = abs(price - stop_price) / price * 100.0
+        dir_text = "🟢 장대양봉 상향 돌파 (LONG)"
     else:
-        fib_line = f"피보나치 구간: 0.382(${fib_levels['0.382']:,.0f}) ~ 0.5(${fib_levels['0.5']:,.0f})"
-        stop_price = fib_levels['swing_high']
-        stop_label = "직전 스윙 하이"
-        stop_pct = abs(stop_price - price) / price * 100.0
+        dir_text = "🔴 장대음봉 하향 돌파 (SHORT)"
 
+    # 권장 손절가: 돌파 캔들의 시가 (현재가와 너무 가까울 경우 중심값 병기)
+    stop_price = eval_res["open"]
+    mid_price = (eval_res["open"] + eval_res["close"]) / 2.0
+    stop_pct = abs(current_price - stop_price) / current_price * 100.0
     risk_50x = stop_pct * 50.0
 
+    header_tag = f"🚀 <b>[BTC 돌파 타점 포착 | 타임프레임: {tf}]</b>"
+    if force_mode and sig is None:
+        header_tag = f"🚀 <b>[BTC 돌파 타점 감시 브리핑 (수동 테스트) | 타임프레임: {tf}]</b>"
+
     msg = (
-        f"{header}\n"
-        f"• 현재가: <code>${price:,.0f}</code> / VWAP: <code>${vwap:,.0f}</code>\n"
-        f"• {fib_line}\n"
-        f"• RSI(14): <code>{rsi:.1f}</code> / 현재 펀딩비: <code>{funding_rate_pct:.4f}%</code>\n"
-        f"• 권장 손절가({stop_label}): <code>${stop_price:,.0f}</code> "
-        f"(손절폭 -{stop_pct:.2f}% / 50배 기준 약 -{risk_50x:.0f}% 리스크)"
+        f"{header_tag}\n"
+        f"• 방향: {dir_text}\n"
+        f"• 돌파 강도: 거래량 평균 대비 <code>{eval_res['vol_pct']:.0f}%</code> 폭발 / 박스권 응축 폭 <code>{eval_res['box_pct']:.2f}%</code>\n"
+        f"• 현재가(진입가): <code>${current_price:,.0f}</code>\n"
+        f"• 박스권 상단: <code>${eval_res['box_high']:,.0f}</code> / 박스권 하단: <code>${eval_res['box_low']:,.0f}</code>\n"
+        f"• 권장 손절가(Stop-Loss): 돌파 캔들 시가 <code>${stop_price:,.0f}</code> [중심값 <code>${mid_price:,.0f}</code>] "
+        f"(손절폭 -{stop_pct:.2f}% / 50배 기준 리스크 -{risk_50x:.0f}%)\n"
+        f"• 현재 펀딩비: <code>{funding_rate_pct:.4f}%</code>"
     )
-
-    if force_mode and signal is None:
-        msg += (
-            f"\n\nℹ️ <i>현재 실시간 타점 조건은 미충족 상태이나, 브리핑 포맷 확인을 위해 강제 전송된 메시지입니다.</i>\n"
-            f"• VWMA(20): <code>${metrics['vwma20']:,.0f}</code> / VWAP 괴리율: <code>{metrics['vwap_diff_pct']:.2f}%</code>\n"
-            f"• 100봉 스윙 하이/로우: <code>${fib_levels['swing_high']:,.0f}</code> / <code>${fib_levels['swing_low']:,.0f}</code>"
-        )
-
     return msg
 
 
@@ -253,48 +317,80 @@ def send_telegram_photo(image_path, caption):
 
 def main():
     force_send = "--force" in sys.argv
+    exchange = init_exchange()
+    state = load_alert_state()
 
-    print("=" * 60)
-    print("📊 [Bitget BTC/USDT 15m 타점 감시 봇 실행]")
-    print("=" * 60)
+    current_price, funding_rate_pct = fetch_common_info(exchange)
+    now_kst = (datetime.now(timezone.utc) + pd.Timedelta(hours=9)).strftime('%Y-%m-%d %H:%M:%S')
 
-    current_price, funding_rate_pct, df = fetch_market_data()
-    df, fib_levels = calculate_indicators(df)
-    signal, metrics = evaluate_signals(current_price, df, fib_levels)
+    print("=" * 92)
+    print(f"📊 [Bitget BTC/USDT 멀티 타임프레임 박스권 거래량 돌파 감시] | 기준시각(KST): {now_kst}")
+    print(f"   현재가: ${current_price:,.2f} | 현재 펀딩비: {funding_rate_pct:.4f}%")
+    print("=" * 92)
+    print(f"{'TF':<4} | {'박스변동폭(기준)':<17} | {'박스 상단 ~ 하단':<23} | {'거래량배수(기준>=2.5x)':<21} | {'장대캔들(ATR/몸통%)':<20} | {'판정'}")
+    print("-" * 92)
 
-    print(f"기준 시간 (KST)       : {df.index[-1].strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"현재가 (Current)      : ${current_price:,.2f}")
-    print(f"당일 VWAP             : ${metrics['vwap']:,.2f} (현재가와 괴리율: {metrics['vwap_diff_pct']:.3f}%)")
-    print(f"VWMA (20)             : ${metrics['vwma20']:,.2f}")
-    print(f"RSI (14)              : {metrics['rsi14']:.2f}")
-    print(f"현재 펀딩비           : {funding_rate_pct:.4f}%")
-    print("-" * 60)
-    print(f"100캔들 Swing High    : ${fib_levels['swing_high']:,.2f}")
-    print(f"피보나치 0.382 저항   : ${fib_levels['0.382']:,.2f}")
-    print(f"피보나치 0.500 중심   : ${fib_levels['0.5']:,.2f}")
-    print(f"피보나치 0.618 지지   : ${fib_levels['0.618']:,.2f}")
-    print(f"100캔들 Swing Low     : ${fib_levels['swing_low']:,.2f}")
-    print("-" * 60)
-    print(f"[🟢 LONG 조건 체크]   : Fib(0.5~0.618)진입={metrics['in_long_fib']} | VWAP(±0.2%)근접={metrics['near_vwap']} | RSI<=42={metrics['long_rsi_ok']}")
-    print(f"[🔴 SHORT 조건 체크]  : Fib(0.382~0.5)진입={metrics['in_short_fib']} | VWAP(±0.2%)근접={metrics['near_vwap']} | RSI>=58={metrics['short_rsi_ok']}")
-    print(f"=> 최종 판정          : {signal if signal else '타점 조건 미충족 (대기)'}")
-    print("=" * 60)
+    triggered_count = 0
+    summary_rows = []
+    last_df = None
+    last_eval = None
 
-    if signal is not None or force_send:
-        label = signal if signal else "TEST BRIEFING"
-        print(f"차트 생성 및 텔레그램 알림 전송 진행 중... (모드: {label})")
-        chart_file = create_signal_chart(df, fib_levels, current_price, label)
-        caption = build_message(signal, metrics, fib_levels, funding_rate_pct, force_mode=force_send)
-        print("\n[전송될 텔레그램 메시지 미리보기]")
-        print(caption)
-        print("-" * 60)
-        res = send_telegram_photo(chart_file, caption)
-        if res.get("ok"):
-            print("✅ 텔레그램 브리핑 전송 완료!")
+    for tf, tf_cfg in TIMEFRAMES.items():
+        df = fetch_tf_dataframe(exchange, tf)
+        eval_res = evaluate_timeframe(df, tf, tf_cfg, state)
+
+        box_str = f"{eval_res['box_pct']:.2f}% (<={tf_cfg['max_box_pct']:.1f}%)"
+        box_mark = "O" if eval_res['is_squeeze'] else "X"
+        range_str = f"${eval_res['box_high']:,.0f}~${eval_res['box_low']:,.0f}"
+        vol_str = f"{eval_res['vol_ratio']:.2f}x ({eval_res['vol_pct']:.0f}%)"
+        vol_mark = "O" if eval_res['is_vol_spike'] else "X"
+        candle_str = f"{eval_res['atr_ratio']:.2f}x / {eval_res['body_ratio_pct']:.0f}%"
+        candle_mark = "O" if eval_res['is_marubozu'] else "X"
+
+        if eval_res['signal'] and not eval_res['already_sent']:
+            status_str = f"🚨 {eval_res['signal']} 돌파 포착!"
+        elif eval_res['signal'] and eval_res['already_sent']:
+            status_str = f"⏭️ {eval_res['signal']} (기전송 스킵)"
         else:
-            print(f"❌ 텔레그램 전송 실패: {res}")
-    else:
-        print("조건이 충족되지 않아 텔레그램 알림을 전송하지 않고 종료합니다.")
+            status_str = f"대기 (박:{box_mark} 볼:{vol_mark} 캔:{candle_mark})"
+
+        print(f"{tf:<4} | {box_str:<17} | {range_str:<23} | {vol_str:<21} | {candle_str:<20} | {status_str}")
+
+        summary_rows.append((tf, eval_res))
+        if tf == "15m" or last_df is None:
+            last_df = df
+            last_eval = eval_res
+
+        # 실제 조건 충족 및 미전송 타점일 때 알림 발송
+        if eval_res['signal'] is not None and not eval_res['already_sent']:
+            triggered_count += 1
+            chart_path = create_breakout_chart(df, tf, eval_res, current_price)
+            caption = build_breakout_message(tf, eval_res, current_price, funding_rate_pct, force_mode=False)
+            res = send_telegram_photo(chart_path, caption)
+            if res.get("ok"):
+                print(f"   -> ✅ [{tf}] 텔레그램 돌파 타점 알림 전송 완료!")
+                state[tf] = eval_res["candle_ts"]
+                save_alert_state(state)
+
+    print("=" * 92)
+
+    # 수동 실행(--force) 시 조건이 하나도 안 맞았더라도 정상 작동 확인용 멀티 타임프레임 요약 브리핑 전송
+    if force_send and triggered_count == 0 and last_df is not None and last_eval is not None:
+        print("수동 테스트 모드(--force): 현재 돌파 타점 미충족 상태이나 4개 타임프레임 요약 브리핑을 전송합니다.")
+        chart_path = create_breakout_chart(last_df, "15m", last_eval, current_price)
+        caption = build_breakout_message("15m", last_eval, current_price, funding_rate_pct, force_mode=True)
+        lines = ["\n\n📋 <b>[멀티 타임프레임 실시간 스캔 요약]</b>"]
+        for tf, ev in summary_rows:
+            sq = "🟢응축" if ev["is_squeeze"] else "⚪비응축"
+            lines.append(
+                f"• <b>{tf}</b>: 박스 <code>{ev['box_pct']:.2f}%</code>({sq}) | "
+                f"거래량 <code>{ev['vol_ratio']:.2f}배({ev['vol_pct']:.0f}%)</code> | "
+                f"몸통 <code>{ev['body_ratio_pct']:.0f}%</code>"
+            )
+        caption += "\n".join(lines)
+        res = send_telegram_photo(chart_path, caption)
+        if res.get("ok"):
+            print("✅ 수동 브리핑 텔레그램 전송 완료!")
 
 
 if __name__ == "__main__":
