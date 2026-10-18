@@ -1,0 +1,19 @@
+# 보안 및 환경변수
+.env
+
+# 가상환경
+.venv/
+venv/
+env/
+
+# 파이썬 캐시 및 설정
+__pycache__/
+*.py[cod]
+*$py.class
+.mplconfig/
+
+# 생성된 차트 이미지
+*.png
+
+# OS 파일
+.DS_Store
