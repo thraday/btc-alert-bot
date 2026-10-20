@@ -176,54 +176,27 @@ def check_htf_alignment(tf, signal_dir, htf_info):
 
 def detect_liquidity_sweep(df, box_high, box_low):
     """
-    [2. 유동성 흡수(Liquidity Sweep / 가짜 돌파 휩소) 감지]
-    - 직전 완성 캔들(iloc[-2]) 또는 진행 중인 캔들(iloc[-1])이
-      박스권 상단(box_high) 또는 하단(box_low)을 고가/저가 꼬리로 찔렀으나,
-      종가(또는 현재가)가 박스권 내부로 깊게 말아 들어와 복귀한 패턴 감지
+    [2. 유동성 흡수(Liquidity Sweep / 가짜 돌파 휩소) 감지 - 초간결 핵심 문구]
     """
-    warnings_list = []
-
-    for pos, tag in [(-2, "직전 마감봉"), (-1, "현재 진행봉")]:
-        c = df.iloc[pos]
-        h, l, o, cl = float(c['High']), float(c['Low']), float(c['Open']), float(c['Close'])
-        rng = h - l
-        if rng <= 0:
-            continue
-
-        upper_wick = h - max(o, cl)
-        lower_wick = min(o, cl) - l
-        upper_wick_pct = upper_wick / rng * 100.0
-        lower_wick_pct = lower_wick / rng * 100.0
-
-        # 상단 유동성 스윕 (Upthrust / Bull Trap): 고가는 box_high 돌파했으나 종가는 box_high 아래로 복귀
-        if h > box_high and cl <= box_high:
-            penetration_pct = (h - box_high) / box_high * 100.0
-            warnings_list.append(
-                f"⚠️ [{tag} 상단 유동성 스윕(Bull Trap) 감지] 고가(${h:,.0f})가 박스 상단(${box_high:,.0f})을 "
-                f"+{penetration_pct:.2f}% 찔렀으나 종가(${cl:,.0f})가 박스 내부로 복귀 (윗꼬리 {upper_wick_pct:.0f}%)"
-            )
-
-        # 하단 유동성 스윕 (Spring / Bear Trap): 저가는 box_low 이탈했으나 종가는 box_low 위로 복귀
-        if l < box_low and cl >= box_low:
-            penetration_pct = (box_low - l) / box_low * 100.0
-            warnings_list.append(
-                f"⚠️ [{tag} 하단 유동성 스윕(Bear Trap) 감지] 저가(${l:,.0f})가 박스 하단(${box_low:,.0f})을 "
-                f"-{penetration_pct:.2f}% 찔렀으나 종가(${cl:,.0f})가 박스 내부로 복귀 (아랫꼬리 {lower_wick_pct:.0f}%)"
-            )
-
-    # 또한 돌파 캔들(iloc[-2])이 마감 돌파했더라도 현재 캔들(iloc[-1])이 즉시 박스 안으로 깊게 되돌아온 경우 경고
     c_prev = df.iloc[-2]
     c_curr = df.iloc[-1]
-    if float(c_prev['Close']) > box_high and float(c_curr['Close']) < box_high:
-        warnings_list.append(
-            f"⚠️ [돌파 직후 박스 내부 재진입 경고] 직전 봉이 상단 돌파 마감했으나 현재가(${float(c_curr['Close']):,.0f})가 "
-            f"다시 박스 상단(${box_high:,.0f}) 아래로 밀려 내려옴 (페이크 돌파 주의)"
-        )
-    elif float(c_prev['Close']) < box_low and float(c_curr['Close']) > box_low:
-        warnings_list.append(
-            f"⚠️ [이탈 직후 박스 내부 재진입 경고] 직전 봉이 하단 이탈 마감했으나 현재가(${float(c_curr['Close']):,.0f})가 "
-            f"다시 박스 하단(${box_low:,.0f}) 위로 말아 올림 (페이크 이탈 주의)"
-        )
+
+    prev_h, prev_l, prev_cl = float(c_prev['High']), float(c_prev['Low']), float(c_prev['Close'])
+    curr_h, curr_l, curr_cl = float(c_curr['High']), float(c_curr['Low']), float(c_curr['Close'])
+
+    warnings_list = []
+
+    # 1) 상단 유동성 스윕 / 재진입 체크
+    if prev_cl > box_high and curr_cl < box_high:
+        warnings_list.append("상단 유동성 스윕(Bull Trap) 후 박스 내부 재진입 발생! (페이크 돌파 주의)")
+    elif (curr_h > box_high and curr_cl <= box_high) or (prev_h > box_high and prev_cl <= box_high):
+        warnings_list.append("상단 유동성 스윕(Bull Trap) 꼬리 찌르기 후 박스 내부 복귀! (페이크 돌파 주의)")
+
+    # 2) 하단 유동성 스윕 / 재진입 체크
+    if prev_cl < box_low and curr_cl > box_low:
+        warnings_list.append("하단 유동성 스윕(Bear Trap) 후 박스 내부 재진입 발생! (페이크 이탈 주의)")
+    elif (curr_l < box_low and curr_cl >= box_low) or (prev_l < box_low and prev_cl >= box_low):
+        warnings_list.append("하단 유동성 스윕(Bear Trap) 꼬리 찌르기 후 박스 내부 복귀! (페이크 이탈 주의)")
 
     return warnings_list
 
@@ -352,9 +325,10 @@ def evaluate_timeframe(df, tf, tf_cfg, htf_info, state):
 
 def create_breakout_chart(df, tf, eval_res, current_price, filename=None):
     """
-    [4. 차트 시각화 고도화]
-    - 최근 60개 캔들 + 거래량(Volume) + VWAP(노란선) + VWMA20(하늘선)
-    - 박스권 상단(초록 점선) / 박스권 하단(주황 점선) / 권장 손절 라인(빨간 굵은 실선) 수평선 시각화
+    [차트 시각화 정돈]
+    - 최근 60개 캔들 + 거래량(Volume) + VWAP(노란선)
+    - 박스권 상/하단(하늘색 점선) + 손절 라인(빨간 굵은 실선)
+    - 깔끔하고 직관적인 1줄 타이틀
     """
     if filename is None:
         filename = f"btc_breakout_{tf}.png"
@@ -365,25 +339,24 @@ def create_breakout_chart(df, tf, eval_res, current_price, filename=None):
     style = mpf.make_mpf_style(
         base_mpf_style='nightclouds',
         marketcolors=mc,
-        gridstyle='--',
+        gridstyle=':',
         y_on_right=True
     )
 
     apds = [
-        mpf.make_addplot(plot_df['VWAP'], color='#ffeb3b', width=1.4, label='VWAP'),
-        mpf.make_addplot(plot_df['VWMA_20'], color='#29b6f6', width=1.2, linestyle='dotted', label='VWMA(20)'),
+        mpf.make_addplot(plot_df['VWAP'], color='#ffeb3b', width=1.3),
     ]
 
-    # 박스권 상단, 박스권 하단, 손절가(Stop-Loss) 수평선 표시
+    # 박스권 상단(점선), 박스권 하단(점선), 손절가 SL(굵은 빨간 실선)
     hlines_vals = [eval_res['box_high'], eval_res['box_low'], eval_res['stop_price']]
-    hlines_colors = ['#00e676', '#ff9800', '#ff1744']
+    hlines_colors = ['#00e5ff', '#00e5ff', '#ff1744']
     hlines_styles = ['--', '--', '-']
-    hlines_widths = [1.2, 1.2, 1.8]
+    hlines_widths = [1.1, 1.1, 1.8]
 
-    sig_text = eval_res['signal'] if eval_res['signal'] else "MONITOR"
+    sig_label = eval_res['effective_dir']
     title = (
-        f"Bitget BTC/USDT [{tf} {sig_text}] | Entry: ${current_price:,.0f} | "
-        f"SL: ${eval_res['stop_price']:,.0f} | Box: {eval_res['box_pct']:.2f}% | Vol: {eval_res['vol_pct']:.0f}%"
+        f"BTC/USDT {tf} [{sig_label}]  |  Entry: ${current_price:,.0f}  |  "
+        f"SL: ${eval_res['stop_price']:,.0f}  |  Box: ${eval_res['box_low']:,.0f}~${eval_res['box_high']:,.0f}"
     )
 
     mpf.plot(
@@ -400,67 +373,49 @@ def create_breakout_chart(df, tf, eval_res, current_price, filename=None):
         style=style,
         title=title,
         savefig=dict(fname=filename, dpi=150, bbox_inches='tight'),
-        figsize=(12, 7)
+        figsize=(11, 6.5)
     )
     return filename
 
 
 def build_breakout_message(tf, eval_res, htf_info, current_price, funding_rate_pct, force_mode=False):
     """
-    [4. 텔레그램 알림 포맷 고도화]
-    - 상위 봉(1h/4h) 추세 일치 여부, 종가 마감 확인 여부, 손절가(돌파 캔들 Low/High 바깥) 및 50배 격리 리스크(%),
-      유동성 스윕(휩소) 경고 문구 포함
+    [초간결 핵심형 텔레그램 알림 포맷]
+    실전 매매 중 1초 만에 파악할 수 있는 심플 레이아웃
     """
-    sig = eval_res["signal"]
     effective_dir = eval_res["effective_dir"]
+    d1h = htf_info["1h"]["direction"]
+    d4h = htf_info["4h"]["direction"]
+
+    if d1h == d4h:
+        htf_str = f"상위봉 1h·4h {'상승' if d1h == 'BULL' else '하락'} 동조"
+    else:
+        htf_str = f"상위봉 1h {'상승' if d1h == 'BULL' else '하락'}·4h {'상승' if d4h == 'BULL' else '하락'}"
 
     if effective_dir == "LONG":
-        dir_text = "🟢 장대양봉 상향 돌파 (LONG)"
-        close_confirm = (
-            f"✅ 종가(${eval_res['close']:,.0f}) &gt; 박스상단(${eval_res['box_high']:,.0f}) 몸통 마감 확정"
-            if eval_res["is_bull_close_break"]
-            else f"⚪ 종가(${eval_res['close']:,.0f}) 박스권 내부 마감 (미돌파)"
-        )
+        emoji = "🟢"
+        dir_line = f"상방 돌파 ({htf_str})"
     else:
-        dir_text = "🔴 장대음봉 하향 돌파 (SHORT)"
-        close_confirm = (
-            f"✅ 종가(${eval_res['close']:,.0f}) &lt; 박스하단(${eval_res['box_low']:,.0f}) 몸통 마감 확정"
-            if eval_res["is_bear_close_break"]
-            else f"⚪ 종가(${eval_res['close']:,.0f}) 박스권 내부 마감 (미돌파)"
-        )
+        emoji = "🔴"
+        dir_line = f"하방 돌파 ({htf_str})"
 
     stop_price = eval_res["stop_price"]
     stop_pct = abs(current_price - stop_price) / current_price * 100.0
     risk_50x = stop_pct * 50.0
 
-    header_tag = f"🚀 <b>[BTC 고신뢰 추세 돌파 포착 | 타임프레임: {tf}]</b>"
-    if force_mode and sig is None:
-        header_tag = f"🚀 <b>[BTC 멀티 타임프레임 추세 돌파 감시 브리핑 | 기준봉: {tf}]</b>"
-
-    htf_summary = (
-        f"1h({'🟢상승' if htf_info['1h']['direction']=='BULL' else '🔴하락'}) / "
-        f"4h({'🟢상승' if htf_info['4h']['direction']=='BULL' else '🔴하락'}) — {eval_res['htf_reason']}"
+    msg = (
+        f"{emoji} <b>[BTC {effective_dir} 포착 - {tf}]</b>\n"
+        f"• 방향: {dir_line}\n"
+        f"• 현재가(진입): <b>${current_price:,.0f}</b>\n"
+        f"• 손절가(SL): <b>${stop_price:,.0f}</b> (-{stop_pct:.2f}% / 50배 리스크 -{risk_50x:.1f}%)\n"
+        f"• 박스권: 상단 ${eval_res['box_high']:,.0f} / 하단 ${eval_res['box_low']:,.0f}\n"
+        f"• 거래량: 평균 대비 <b>{eval_res['vol_pct']:.0f}%</b> 폭발"
     )
 
     if eval_res["sweep_warnings"]:
-        sweep_section = "\n".join(eval_res["sweep_warnings"])
-    else:
-        sweep_section = "✅ 유동성 스윕(꼬리 말아올림/내림) 이상 징후 없음"
+        warn_bullets = "\n".join(f"• {w}" for w in eval_res["sweep_warnings"])
+        msg += f"\n\n⚠️ <b>[특이사항 / 휩소 경고]</b>\n{warn_bullets}"
 
-    msg = (
-        f"{header_tag}\n"
-        f"• <b>방향</b>: {dir_text}\n"
-        f"• <b>상위봉 추세 동조</b>: {htf_summary}\n"
-        f"• <b>종가 마감 확인</b>: {close_confirm} ({eval_res['candle_time_kst']} 마감봉)\n"
-        f"• <b>돌파 강도</b>: 거래량 평균 대비 <code>{eval_res['vol_pct']:.0f}%</code> ({eval_res['vol_ratio']:.2f}배) / "
-        f"박스권 응축 폭 <code>{eval_res['box_pct']:.2f}%</code> (몸통비율 <code>{eval_res['body_ratio_pct']:.0f}%</code>)\n"
-        f"• <b>현재가(진입가)</b>: <code>${current_price:,.0f}</code>\n"
-        f"• <b>박스권 구간</b>: 상단 <code>${eval_res['box_high']:,.0f}</code> / 하단 <code>${eval_res['box_low']:,.0f}</code> (차트 초록/주황 점선)\n"
-        f"• <b>권장 손절가(Stop-Loss)</b>: <code>${stop_price:,.0f}</code> ({eval_res['stop_basis_label']} / 차트 빨간 실선)\n"
-        f"  └ <b>예상 리스크</b>: 손절폭 <code>-{stop_pct:.2f}%</code> / <b>50배 격리 기준 <code>-{risk_50x:.1f}%</code></b>\n"
-        f"• <b>현재 펀딩비</b>: <code>{funding_rate_pct:.4f}%</code>\n"
-        f"• <b>휩소/유동성 스윕 체크</b>:\n  {sweep_section}"
-    )
     return msg
 
 
@@ -553,29 +508,18 @@ def main():
 
     print("=" * 105)
 
-    # 수동 실행(--force) 시 조건이 안 맞았더라도 정상 작동 확인용 멀티 타임프레임 요약 브리핑 전송
+    # 수동 실행(--force) 시에도 동일한 초간결 핵심형 포맷으로 1회 브리핑 전송
     if force_send and triggered_count == 0:
-        print("수동 테스트 모드(--force): 현재 돌파 타점 미충족 상태이나 4개 타임프레임 상태 브리핑을 전송합니다.")
+        print("수동 테스트 모드(--force): 초간결 핵심형 포맷으로 브리핑을 전송합니다.")
         ref_tf = "15m"
         ref_df = dfs[ref_tf]
         ref_eval = dict(summary_rows)[ref_tf]
 
         chart_path = create_breakout_chart(ref_df, ref_tf, ref_eval, current_price)
         caption = build_breakout_message(ref_tf, ref_eval, htf_info, current_price, funding_rate_pct, force_mode=True)
-
-        lines = ["\n\n📋 <b>[멀티 타임프레임 실시간 스캔 요약]</b>"]
-        for tf, ev in summary_rows:
-            sq = "🟢응축" if ev["is_squeeze"] else "⚪비응축"
-            sw = " | ⚠️스윕감지" if ev["sweep_warnings"] else ""
-            lines.append(
-                f"• <b>{tf}</b>: 박스 <code>{ev['box_pct']:.2f}%</code>({sq}) | "
-                f"거래량 <code>{ev['vol_ratio']:.2f}배({ev['vol_pct']:.0f}%)</code> | "
-                f"몸통 <code>{ev['body_ratio_pct']:.0f}%</code>{sw}"
-            )
-        caption += "\n".join(lines)
         res = send_telegram_photo(chart_path, caption)
         if res.get("ok"):
-            print("✅ 수동 브리핑 텔레그램 전송 완료!")
+            print("✅ 초간결 브리핑 텔레그램 전송 완료!")
 
 
 if __name__ == "__main__":
