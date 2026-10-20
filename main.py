@@ -26,19 +26,18 @@ SYMBOL = "BTC/USDT:USDT"
 LIMIT = 100
 STATE_FILE = os.path.join(BASE_DIR, ".alert_state.json")
 
-# 멀티 타임프레임 설정:
-# - max_box_pct: 직전 20캔들 박스권 최대 변동폭 (%)
-# - tf_minutes: 타임프레임 분 단위 길이
-# - allowed_lag_min: 봉 마감 직후 허용 시간 창 (분)
-#   * 5m : 5분 단위 정각 직후 (0~2분 이내)
-#   * 15m: 매 0, 15, 30, 45분 직후 (0~3분 이내)
-#   * 1h : 매 시간 0분~4분 사이 (0~4분 이내)
-#   * 4h : 4시간봉 마감 직후 0분~4분 사이 (0~4분 이내)
+# [1. 멀티 타임프레임 확장 및 변동폭 기준 최적화]
+# - 5m : 직전 20캔들 변동폭 1.2% 이내 (5분 정각 직후 0~2분)
+# - 15m: 직전 20캔들 변동폭 1.8% 이내 (0, 15, 30, 45분 직후 0~3분)
+# - 1h : 직전 20캔들 변동폭 3.0% 이내 (매 시간 정각 직후 0~4분)
+# - 4h : 직전 20캔들 변동폭 5.0% 이내 (4시간 단위 정각 직후 0~4분)
+# - 1d : 직전 20캔들 변동폭 10.0% 이내 (하루가 바뀌는 자정 00:00 직후 0~4분)
 TIMEFRAMES = {
-    "5m":  {"max_box_pct": 1.2, "tf_minutes": 5,   "allowed_lag_min": 2},
-    "15m": {"max_box_pct": 1.8, "tf_minutes": 15,  "allowed_lag_min": 3},
-    "1h":  {"max_box_pct": 3.0, "tf_minutes": 60,  "allowed_lag_min": 4},
-    "4h":  {"max_box_pct": 5.0, "tf_minutes": 240, "allowed_lag_min": 4},
+    "5m":  {"max_box_pct": 1.2,  "tf_minutes": 5,    "allowed_lag_min": 2},
+    "15m": {"max_box_pct": 1.8,  "tf_minutes": 15,   "allowed_lag_min": 3},
+    "1h":  {"max_box_pct": 3.0,  "tf_minutes": 60,   "allowed_lag_min": 4},
+    "4h":  {"max_box_pct": 5.0,  "tf_minutes": 240,  "allowed_lag_min": 4},
+    "1d":  {"max_box_pct": 10.0, "tf_minutes": 1440, "allowed_lag_min": 4},
 }
 
 # 손절가 여유 버퍼 (돌파 캔들 최저점 바로 아래 / 최고점 바로 위: 0.03%)
@@ -91,14 +90,17 @@ def fetch_tf_dataframe(exchange, tf):
     df['Date'] = df['UTC_Date'] + pd.Timedelta(hours=9)  # KST
     df.set_index('Date', inplace=True)
 
-    # 당일 기준 VWAP 계산
-    vwap_series = ta.vwap(df['High'], df['Low'], df['Close'], df['Volume'])
-    if vwap_series is None or vwap_series.isna().all():
-        tp = (df['High'] + df['Low'] + df['Close']) / 3.0
-        tp_vol = tp * df['Volume']
-        day_group = df.index.date
-        vwap_series = tp_vol.groupby(day_group).cumsum() / df['Volume'].groupby(day_group).cumsum()
-    df['VWAP'] = vwap_series
+    # VWAP 계산 (1d의 경우 20일 누적 VWAP, 하위봉은 당일 누적 VWAP)
+    tp = (df['High'] + df['Low'] + df['Close']) / 3.0
+    tp_vol = tp * df['Volume']
+    if tf == "1d":
+        df['VWAP'] = tp_vol.rolling(20).sum() / df['Volume'].rolling(20).sum()
+    else:
+        vwap_series = ta.vwap(df['High'], df['Low'], df['Close'], df['Volume'])
+        if vwap_series is None or vwap_series.isna().all():
+            day_group = df.index.date
+            vwap_series = tp_vol.groupby(day_group).cumsum() / df['Volume'].groupby(day_group).cumsum()
+        df['VWAP'] = vwap_series
 
     # 상위 추세 판별용 VWMA(20) & 단기 EMA(9) & ATR(14)
     df['VWMA_20'] = ta.vwma(df['Close'], df['Volume'], length=20)
@@ -109,128 +111,164 @@ def fetch_tf_dataframe(exchange, tf):
 
 def is_within_close_window(tf, now_utc, df):
     """
-    [3 & 4. 시간대별 실행 타이밍 및 타임스탬프 필터]
-    - 봉이 한참 진행 중인 애매한 시간대(예: 51분 등)에는 상위 타임프레임 시그널 검사를 원천 차단!
-    - 1h 봉 : 매 시간 0분 ~ 4분 사이일 때만 검사 허용
-    - 15m 봉: 매 0분, 15분, 30분, 45분 직후 (0~3분 사이)에만 검사 허용
-    - 5m 봉 : 매 5분 단위 정각 직후 (0~2분 사이)에만 검사 허용
-    - 4h 봉 : 4시간봉 마감 시각 직후 (0~4분 사이)에만 검사 허용
-    - 동시에 실제 직전 마감 캔들(iloc[-2])의 마감 시각(candle_open_ts + tf_ms)으로부터도
-      allowed_lag_min 이내인지 이중 타임스탬프 검증 수행
+    [2. 봉 마감 확정 조건 및 시간대별 실행 타이밍 필터]
+    - 5m : 5분 정각 직후 (0~2분)
+    - 15m: 0분, 15분, 30분, 45분 직후 (0~3분)
+    - 1h : 매 시간 정각 직후 (0~4분)
+    - 4h : 4시간 단위 정각 직후 (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC 또는 캔들 마감 직후 0~4분)
+    - 1d : 하루가 바뀌는 자정(00:00 UTC 또는 00:00 KST) 직후 (0~4분)에만 1일봉 데이터 검사
     """
+    now_kst = now_utc + pd.Timedelta(hours=9)
     minute = now_utc.minute
+    hour_utc = now_utc.hour
+    hour_kst = now_kst.hour
+
     tf_cfg = TIMEFRAMES[tf]
     tf_min = tf_cfg["tf_minutes"]
     allowed_lag = tf_cfg["allowed_lag_min"]
 
-    # 1) 현재 시각(분) 기준 윈도우 체크
-    if tf == "5m":
-        clock_ok = (minute % 5) <= allowed_lag
-        rule_desc = f"5m 정각 직후(0~{allowed_lag}분)"
-    elif tf == "15m":
-        clock_ok = (minute % 15) <= allowed_lag
-        rule_desc = f"0·15·30·45분 직후(0~{allowed_lag}분)"
-    elif tf == "1h":
-        clock_ok = minute <= allowed_lag
-        rule_desc = f"매시 0~{allowed_lag}분"
-    elif tf == "4h":
-        # Bitget 4h 캔들 마감 시각은 직전 마감 캔들(iloc[-2])의 종료 타임스탬프로 정확히 판별
-        clock_ok = minute <= allowed_lag
-        rule_desc = f"4h 마감 직후 0~{allowed_lag}분"
-    else:
-        clock_ok = False
-        rule_desc = "알 수 없음"
-
-    # 2) 직전 마감 완성 캔들(iloc[-2])의 실제 마감 타임스탬프와 현재 시각 비교
     now_ms = int(now_utc.timestamp() * 1000)
     closed_open_ts = int(df['timestamp'].iloc[-2])
     closed_end_ts = closed_open_ts + (tf_min * 60 * 1000)
     elapsed_min_since_close = (now_ms - closed_end_ts) / 60000.0
-
-    # 마감 후 경과 시간이 0분 이상이고 (allowed_lag + 0.99)분 이내여야 함
     ts_ok = 0.0 <= elapsed_min_since_close < (allowed_lag + 1.0)
 
-    is_valid_timing = clock_ok and ts_ok
-    return is_valid_timing, elapsed_min_since_close, rule_desc
+    if tf == "5m":
+        clock_ok = (minute % 5) <= allowed_lag
+        rule_desc = f"5m 정각 직후(0~{allowed_lag}분)"
+        is_valid = clock_ok and ts_ok
+    elif tf == "15m":
+        clock_ok = (minute % 15) <= allowed_lag
+        rule_desc = f"0·15·30·45분 직후(0~{allowed_lag}분)"
+        is_valid = clock_ok and ts_ok
+    elif tf == "1h":
+        clock_ok = minute <= allowed_lag
+        rule_desc = f"매시 정각 직후(0~{allowed_lag}분)"
+        is_valid = clock_ok and ts_ok
+    elif tf == "4h":
+        # 4시간 단위 정각 직후 (UTC 0,4,8,12,16,20시 또는 거래소 4h 캔들 마감 직후 0~4분)
+        clock_ok = (minute <= allowed_lag) and ((hour_utc % 4 == 0) or ts_ok)
+        rule_desc = f"4h 정각 직후(0~{allowed_lag}분)"
+        is_valid = clock_ok and ts_ok
+    elif tf == "1d":
+        # 하루가 바뀌는 자정(00시 UTC 또는 00시 KST) 직후 0~4분
+        clock_ok = (minute <= allowed_lag) and (hour_utc == 0 or hour_kst == 0)
+        rule_desc = f"자정(00시) 직후(0~{allowed_lag}분)"
+        is_valid = clock_ok and ts_ok
+    else:
+        rule_desc = "알 수 없음"
+        is_valid = False
+
+    return is_valid, elapsed_min_since_close, rule_desc
 
 
-def analyze_htf_trend(df_1h, df_4h):
+def analyze_macro_htf_trend(dfs):
     """
-    [상위 봉(1h / 4h) 주추세 분석 - 반드시 마감된 직전 완성 캔들(iloc[-2]) 기준으로 판별]
+    [3. 상위 추세(1h / 4h / 1d) 복합 분석 - 직전 마감 완성 캔들(iloc[-2]) 기준]
+    - 각 상위 봉의 마감 종가 vs VWMA(20) 위치 및 직전 20캔들 박스권 내 상대 위치(상단/하단)를 복합 체크
     """
     def get_single_tf_trend(df, label):
         closed_c = df.iloc[-2]  # 완전히 마감된 직전 캔들
         prev_c = df.iloc[-3]
+        box_df = df.iloc[-22:-2]
+
         close_p = float(closed_c['Close'])
         vwma20 = float(closed_c['VWMA_20'])
         vwma20_prev = float(prev_c['VWMA_20'])
         ema9 = float(closed_c['EMA_9'])
 
+        box_high = float(box_df['High'].max())
+        box_low = float(box_df['Low'].min())
+        box_mid = (box_high + box_low) / 2.0
+
         above_vwma = close_p >= vwma20
         vwma_rising = vwma20 >= vwma20_prev
-        short_bull = close_p >= ema9
+        above_box_mid = close_p >= box_mid
 
-        if above_vwma and (vwma_rising or short_bull):
+        if close_p > box_high:
+            box_pos = "박스상단돌파"
+        elif close_p < box_low:
+            box_pos = "박스하단이탈"
+        elif above_box_mid:
+            box_pos = "박스상단권"
+        else:
+            box_pos = "박스하단권"
+
+        # VWMA(20) 위치와 박스 중심/기울기 복합 판정
+        if above_vwma and (vwma_rising or above_box_mid or close_p >= ema9):
             direction = "BULL"
-            desc = f"{label} 상승추세 (마감종가 &gt; VWMA20 ${vwma20:,.0f})"
-        elif (not above_vwma) and ((not vwma_rising) or (not short_bull)):
+            desc = f"{label} 상승(종가&gt;VWMA20 ${vwma20:,.0f}, {box_pos})"
+        elif (not above_vwma) and ((not vwma_rising) or (not above_box_mid) or close_p < ema9):
             direction = "BEAR"
-            desc = f"{label} 하락추세 (마감종가 &lt; VWMA20 ${vwma20:,.0f})"
+            desc = f"{label} 하락(종가&lt;VWMA20 ${vwma20:,.0f}, {box_pos})"
         else:
             direction = "BULL" if above_vwma else "BEAR"
-            desc = f"{label} {'완만한 상승' if above_vwma else '완만한 하락'} (VWMA20 ${vwma20:,.0f})"
+            desc = f"{label} {'강세우위' if above_vwma else '약세우위'}(VWMA20 ${vwma20:,.0f}, {box_pos})"
 
         return {
             "tf": label,
             "direction": direction,
             "close": close_p,
             "vwma20": vwma20,
-            "vwma_rising": vwma_rising,
+            "box_pos": box_pos,
             "desc": desc,
         }
 
-    t_1h = get_single_tf_trend(df_1h, "1h")
-    t_4h = get_single_tf_trend(df_4h, "4h")
+    return {
+        "1h": get_single_tf_trend(dfs["1h"], "1h"),
+        "4h": get_single_tf_trend(dfs["4h"], "4h"),
+        "1d": get_single_tf_trend(dfs["1d"], "1d"),
+    }
 
-    return {"1h": t_1h, "4h": t_4h}
 
+def check_macro_alignment(tf, signal_dir, htf_info):
+    """
+    하위 봉(5m, 15m, 1h) 및 중장기 봉(4h, 1d) 시그널 발생 시
+    거시 상위 봉(4h & 1d, 그리고 단기봉의 경우 1h 포함) 추세 일치 여부 복합 판정
+    """
+    d1h = htf_info["1h"]["direction"]
+    d4h = htf_info["4h"]["direction"]
+    d1d = htf_info["1d"]["direction"]
 
-def check_htf_alignment(tf, signal_dir, htf_info):
-    """하위 봉 돌파 시 상위 봉(1h/4h) 추세 동조 여부 검증"""
-    if signal_dir is None:
-        return True, "시그널 없음"
+    target = "BULL" if signal_dir == "LONG" else "BEAR"
+    kor_target = "상승" if target == "BULL" else "하락"
 
-    dir_1h = htf_info["1h"]["direction"]
-    dir_4h = htf_info["4h"]["direction"]
-
-    target_trend = "BULL" if signal_dir == "LONG" else "BEAR"
-    kor_dir = "상승" if target_trend == "BULL" else "하락"
+    s1h = "상승" if d1h == "BULL" else "하락"
+    s4h = "상승" if d4h == "BULL" else "하락"
+    s1d = "상승" if d1d == "BULL" else "하락"
 
     if tf in ("5m", "15m"):
-        if dir_1h == target_trend and dir_4h == target_trend:
-            return True, f"✅ 상위봉 완벽 동조 (1h·4h 모두 {kor_dir} 추세)"
-        elif dir_1h == target_trend:
-            return True, f"✅ 1h 주추세 동조 (1h {kor_dir} / 4h {'상승' if dir_4h == 'BULL' else '하락'})"
+        # 4h & 1d 거시 추세와 1h 중기 추세 복합 체크
+        if d1h == target and d4h == target and d1d == target:
+            return True, f"1h·4h·1d 전구간 {kor_target} 정배열 동조"
+        elif d4h == target and d1d == target:
+            return True, f"상위봉 4h·1d {kor_target} 동조 (1h {s1h})"
+        elif d1h == target and (d4h == target or d1d == target):
+            return True, f"상위봉 1h·{'4h' if d4h == target else '1d'} {kor_target} 동조"
         else:
-            return False, f"❌ 상위봉 역추세 필터링됨 (1h {htf_info['1h']['desc']} 역행)"
+            return False, f"상위봉 4h({s4h})·1d({s1d}) 역추세 불일치"
     elif tf == "1h":
-        if dir_4h == target_trend or dir_1h == target_trend:
-            return True, f"✅ 상위봉 추세 동조 (1h {'상승' if dir_1h == 'BULL' else '하락'} / 4h {'상승' if dir_4h == 'BULL' else '하락'})"
+        if d4h == target and d1d == target:
+            return True, f"거시 상위봉 4h·1d {kor_target} 완벽 동조"
+        elif d4h == target or d1d == target:
+            return True, f"상위봉 4h({s4h})·1d({s1d}) 부분 동조"
         else:
-            return False, f"❌ 4h 대추세 역행 필터링됨 ({htf_info['4h']['desc']})"
-    else:  # 4h
-        return True, f"✅ 4h 메이저 추세 돌파 ({htf_info['4h']['desc']})"
+            return False, f"거시 상위봉 4h·1d 모두 역방향({s4h})"
+    elif tf == "4h":
+        if d1d == target:
+            return True, f"1d 일봉 대추세({s1d}) 동조"
+        else:
+            return False, f"1d 일봉 대추세({s1d}) 역행"
+    else:  # 1d
+        return True, f"1d 거시 일봉 추세({s1d}) 직접 돌파"
 
 
 def detect_liquidity_sweep_closed_only(df, box_high, box_low):
     """
-    [1 & 2. 유동성 흡수(Liquidity Sweep) 판정 - 오직 완전히 마감된 직전 캔들(iloc[-2])만 기준!]
-    - 진행 중인 미완성 캔들(iloc[-1])은 노이즈 방지를 위해 판정에서 완전히 배제함.
-    - 직전 완성 캔들(iloc[-2])의 고가/저가가 박스권 상/하단을 찔렀으나 종가(Close)가 박스권 내부로 말아 들어와 마감된 경우,
-      또는 그 직전 완성 캔들(iloc[-3])이 돌파 마감했으나 직전 완성 캔들(iloc[-2])이 종가로 박스 내부에 재진입 마감한 경우만 인정.
+    [유동성 흡수(Liquidity Sweep) 판정 - 오직 완전히 마감된 직전 캔들(iloc[-2])만 기준]
     """
-    c_closed = df.iloc[-2]      # 완전히 마감된 직전 캔들
-    c_prev_closed = df.iloc[-3] # 그 직전 마감 캔들
+    c_closed = df.iloc[-2]       # 완전히 마감된 직전 캔들
+    c_prev_closed = df.iloc[-3]  # 그 직전 마감 캔들
 
     cl_h, cl_l, cl_close = float(c_closed['High']), float(c_closed['Low']), float(c_closed['Close'])
     prev_close = float(c_prev_closed['Close'])
@@ -265,13 +303,11 @@ def detect_liquidity_sweep_closed_only(df, box_high, box_low):
 def analyze_closed_breakout(df, tf, tf_cfg, htf_info):
     """
     [완전히 마감된 직전 캔들(iloc[-2]) 전용 돌파 및 유동성 스윕 분석]
-    - 진행 중인 미완성 캔들(iloc[-1])은 일절 참조하지 않음
     """
     max_box_pct = tf_cfg["max_box_pct"]
     box_df = df.iloc[-22:-2]  # 돌파 캔들(iloc[-2]) 직전 20개 완성 캔들
     atr_prev = float(df['ATR_14'].iloc[-3])
     candle = df.iloc[-2]      # 완전히 마감된 직전 캔들 (iloc[-2])
-    forming = df.iloc[-1]     # 현재 진행 중인 미완성 캔들 (iloc[-1], 구분 표시용)
 
     # 1) 박스권 응축 (돌파 직전 20개 캔들)
     box_high = float(box_df['High'].max())
@@ -311,8 +347,6 @@ def analyze_closed_breakout(df, tf, tf_cfg, htf_info):
 
     # 5) 직전 완성 캔들(iloc[-2]) 전용 유동성 스윕 감지
     sweep_type, sweep_supply_note, sweep_warnings = detect_liquidity_sweep_closed_only(df, box_high, box_low)
-
-    # 스윕 단독 이벤트 (박스권 응축 + 완성봉 거래량 2.5배 이상 + 완성봉 꼬리 스윕 마감)
     is_sweep_event = is_squeeze and is_vol_spike and (sweep_type is not None)
 
     if raw_signal is not None:
@@ -324,48 +358,42 @@ def analyze_closed_breakout(df, tf, tf_cfg, htf_info):
     else:
         effective_dir = "LONG" if close_p >= open_p else "SHORT"
 
-    # 6) 상위 봉(1h/4h) 추세 동조 필터 적용
-    htf_aligned, htf_reason = check_htf_alignment(tf, effective_dir, htf_info)
-    d1h = htf_info["1h"]["direction"]
-    d4h = htf_info["4h"]["direction"]
-    if d1h == d4h:
-        htf_short_desc = f"상위봉 1h·4h {'상승' if d1h == 'BULL' else '하락'} 동조"
-    else:
-        htf_short_desc = f"상위봉 1h {'상승' if d1h == 'BULL' else '하락'}·4h {'상승' if d4h == 'BULL' else '하락'}"
+    # 6) 상위 봉(1h / 4h / 1d) 복합 추세 동조 확인
+    htf_aligned, htf_summary = check_macro_alignment(tf, effective_dir, htf_info)
 
-    # 7) 전략 타입 판정 (Type A vs Type B)
+    # 7) 전략 타입 판정 (Type A 돌파 추격 vs Type B 유동성 스윕/역추세 반전)
     final_signal = None
     strategy_type = "NONE"
 
     if raw_signal is not None and htf_aligned and sweep_type is None:
         strategy_type = "TYPE_A"
         final_signal = raw_signal
-        strategy_text = f"🚀 돌파 추격 매매 권장 ({htf_short_desc} / 종가 마감 확정)"
+        strategy_text = f"🚀 돌파 추격 매매 권장 ({htf_summary})"
         supply_detail = "장대몸통 종가 돌파 마감"
     elif (raw_signal is not None) or is_sweep_event:
         strategy_type = "TYPE_B"
         final_signal = effective_dir
         rev_word = "반등" if effective_dir == "SHORT" else "조정"
         if sweep_type is not None:
-            strategy_text = f"⚠️ 유동성 스윕 경고 (추격 매매 금지 / 반대 방향 {rev_word} 관점 접근)"
+            strategy_text = f"⚠️ 유동성 스윕 경고 (추격 금지 / 반대 방향 {rev_word} 관점 · {htf_summary})"
             supply_detail = sweep_supply_note
         else:
-            strategy_text = f"⚠️ 상위봉 역추세 휩소 주의 (추격 매매 금지 / 박스권 회귀·{rev_word} 관점 접근)"
+            strategy_text = f"⚠️ 상위봉 역추세 휩소 주의 (추격 금지 / {htf_summary} · 박스 회귀 주의)"
             supply_detail = "역추세 돌파 마감 (휩소 주의)"
     else:
         if sweep_type is not None:
             strategy_type = "TYPE_B"
             rev_word = "반등" if effective_dir == "SHORT" else "조정"
-            strategy_text = f"⚠️ 유동성 스윕 경고 (추격 매매 금지 / 반대 방향 {rev_word} 관점 접근)"
+            strategy_text = f"⚠️ 유동성 스윕 경고 (추격 금지 / 반대 방향 {rev_word} 관점 · {htf_summary})"
             supply_detail = sweep_supply_note
         elif htf_aligned and (is_bull_close_break or is_bear_close_break):
             strategy_type = "TYPE_A"
-            strategy_text = f"🚀 돌파 추격 매매 권장 ({htf_short_desc} / 종가 마감 확정)"
+            strategy_text = f"🚀 돌파 추격 매매 권장 ({htf_summary})"
             supply_detail = "장대몸통 종가 돌파 마감"
         else:
             strategy_type = "TYPE_B"
             rev_word = "반등" if effective_dir == "SHORT" else "조정"
-            strategy_text = f"⚠️ 박스권 내부 횡보/스윕 주의 (추격 매매 금지 / {rev_word}·회귀 관점 접근)"
+            strategy_text = f"⚠️ 박스권 내부 수렴 중 ({htf_summary} / 돌파 전 추격 금지)"
             supply_detail = sweep_supply_note if sweep_supply_note else "박스권 내부 마감"
 
     # 8) 권장 손절가(Stop-Loss) 계산 (완성된 돌파 캔들 iloc[-2]의 최저점/최고점 기준)
@@ -374,16 +402,17 @@ def analyze_closed_breakout(df, tf, tf_cfg, htf_info):
     else:
         stop_price = high_p * (1.0 + SL_BUFFER_PCT)
 
-    tf_ms = tf_cfg["tf_minutes"] * 60 * 1000
-    closed_open_kst = df.index[-2].strftime('%H:%M')
-    closed_end_kst = (df.index[-2] + pd.Timedelta(minutes=tf_cfg["tf_minutes"])).strftime('%H:%M')
-    forming_open_kst = df.index[-1].strftime('%H:%M')
+    if tf == "1d":
+        closed_open_str = df.index[-2].strftime('%m/%d')
+        closed_label = f"완성일봉(iloc[-2]: {closed_open_str})"
+    else:
+        closed_open_kst = df.index[-2].strftime('%H:%M')
+        closed_end_kst = (df.index[-2] + pd.Timedelta(minutes=tf_cfg["tf_minutes"])).strftime('%H:%M')
+        closed_label = f"완성봉(iloc[-2]: {closed_open_kst}~{closed_end_kst})"
 
     return {
         "candle_ts": int(candle['timestamp']),
-        "closed_End_ts": int(candle['timestamp']) + tf_ms,
-        "closed_candle_label": f"완성봉(iloc[-2]: {closed_open_kst}~{closed_end_kst})",
-        "forming_candle_label": f"미완성봉(iloc[-1]: {forming_open_kst}~진행중)",
+        "closed_candle_label": closed_label,
         "open": open_p,
         "high": high_p,
         "low": low_p,
@@ -407,7 +436,7 @@ def analyze_closed_breakout(df, tf, tf_cfg, htf_info):
         "is_bear_close_break": is_bear_close_break,
         "raw_signal": raw_signal,
         "htf_aligned": htf_aligned,
-        "htf_reason": htf_reason,
+        "htf_summary": htf_summary,
         "signal": final_signal,
         "effective_dir": effective_dir,
         "strategy_type": strategy_type,
@@ -425,7 +454,6 @@ def create_breakout_chart(df, tf, eval_res, current_price, filename=None):
     if filename is None:
         filename = f"btc_breakout_{tf}.png"
 
-    # 미완성 진행 캔들(iloc[-1]) 노이즈를 제외하고 마감 완료된 최근 60개 캔들 시각화
     plot_df = df.iloc[:-1].tail(60).copy()
 
     mc = mpf.make_marketcolors(up='#26a69a', down='#ef5350', inherit=True)
@@ -473,7 +501,7 @@ def create_breakout_chart(df, tf, eval_res, current_price, filename=None):
 
 def build_breakout_message(tf, eval_res, current_price):
     """
-    [초간결 미니 카드형 텔레그램 알림 포맷]
+    [초간결 미니 카드형 텔레그램 알림 포맷 (4h/1d 거시 추세 일치 여부 포함)]
     """
     effective_dir = eval_res["effective_dir"]
     emoji = "🟢" if effective_dir == "LONG" else "🔴"
@@ -520,20 +548,20 @@ def main():
 
     current_price, funding_rate_pct = fetch_common_info(exchange)
 
-    # 상위 봉(1h, 4h) 추세 파악을 위해 데이터 조회
+    # 5개 타임프레임(['5m', '15m', '1h', '4h', '1d']) 데이터 조회
     dfs = {}
     for tf in TIMEFRAMES:
         dfs[tf] = fetch_tf_dataframe(exchange, tf)
 
-    htf_info = analyze_htf_trend(dfs["1h"], dfs["4h"])
+    htf_info = analyze_macro_htf_trend(dfs)
 
-    print("=" * 118)
-    print(f"📊 [Bitget BTC/USDT 엄격 봉마감 확정 기반 돌파/스윕 감시 시스템] | 실행시각(KST): {now_kst} ({now_kst_dt.minute}분)")
+    print("=" * 124)
+    print(f"📊 [Bitget BTC/USDT 5대 타임프레임(5m~1d) 봉마감 돌파/스윕 감시 시스템] | 실행시각(KST): {now_kst}")
     print(f"   현재가: ${current_price:,.2f} | 현재 펀딩비: {funding_rate_pct:.4f}%")
-    print(f"   [상위봉 마감추세] 1h: {htf_info['1h']['desc']} | 4h: {htf_info['4h']['desc']}")
-    print("=" * 118)
-    print(f"{'TF':<4} | {'타이밍 게이트 (봉마감 직후 체크)':<32} | {'분석 대상 캔들 구분':<25} | {'박스폭 / 거래량':<19} | {'판정 결과'}")
-    print("-" * 118)
+    print(f"   [상위봉 마감추세] 1h: {htf_info['1h']['desc']} | 4h: {htf_info['4h']['desc']} | 1d: {htf_info['1d']['desc']}")
+    print("=" * 124)
+    print(f"{'TF':<4} | {'타이밍 게이트 (봉마감 직후 필터)':<34} | {'직전 마감봉(iloc[-2]) 박스폭/거래량':<28} | {'상위추세 동조 및 판정 결과'}")
+    print("-" * 124)
 
     triggered_count = 0
     evaluated_rows = []
@@ -541,33 +569,30 @@ def main():
     for tf, tf_cfg in TIMEFRAMES.items():
         df = dfs[tf]
         is_valid_timing, elapsed_min, rule_desc = is_within_close_window(tf, now_utc, df)
+        eval_res = analyze_closed_breakout(df, tf, tf_cfg, htf_info)
+        metric_str = f"박스 {eval_res['box_pct']:.2f}% (<={tf_cfg['max_box_pct']:.1f}%) / 거래량 {eval_res['vol_pct']:.0f}%"
 
-        # 타이밍 게이트 미통과 시 (예: 51분 등 봉이 한참 진행 중인 시간대) 시그널 검사 스킵!
+        # 타이밍 게이트 미통과 시 시그널 발송 원천 차단 (터미널에는 직전 완성봉 수치 참고 표시)
         if not is_valid_timing:
-            forming_kst = df.index[-1].strftime('%H:%M')
-            gate_str = f"⏸️ 비활성 (마감+{elapsed_min:.0f}분 경과, {rule_desc}만 허용)"
-            candle_str = f"미완성(iloc[-1]: {forming_kst}~)"
-            print(f"{tf:<4} | {gate_str:<32} | {candle_str:<25} | {'검사 생략 (진행중)':<19} | ⛔ 봉 진행 중 (시그널 검사 차단)")
+            gate_str = f"⏸️ 비활성 (+{elapsed_min:.0f}분 경과, {rule_desc})"
+            print(f"{tf:<4} | {gate_str:<34} | {metric_str:<28} | ⛔ 봉 진행 중 (시그널 검사 차단 | {eval_res['htf_summary']})")
             continue
 
         # 타이밍 게이트 통과: 직전 마감 완성 캔들(iloc[-2]) 기준으로만 엄격 판정 수행
-        eval_res = analyze_closed_breakout(df, tf, tf_cfg, htf_info)
         already_sent = (state.get(tf) == eval_res["candle_ts"])
         eval_res["already_sent"] = already_sent
         evaluated_rows.append((tf, eval_res))
 
         gate_str = f"✅ 활성 (마감+{elapsed_min:.1f}분, {rule_desc})"
-        candle_str = eval_res["closed_candle_label"]
-        metric_str = f"{eval_res['box_pct']:.2f}% / {eval_res['vol_pct']:.0f}%"
 
         if eval_res['signal'] and not already_sent:
-            status_str = f"🚨 [{eval_res['strategy_type']}] {eval_res['signal']} 포착!"
+            status_str = f"🚨 [{eval_res['strategy_type']}] {eval_res['strategy_text']}"
         elif eval_res['signal'] and already_sent:
             status_str = f"⏭️ {eval_res['signal']} (기전송 완료 스킵)"
         else:
-            status_str = f"대기 ({eval_res['supply_detail']})"
+            status_str = f"대기 ({eval_res['supply_detail']} | {eval_res['htf_summary']})"
 
-        print(f"{tf:<4} | {gate_str:<32} | {candle_str:<25} | {metric_str:<19} | {status_str}")
+        print(f"{tf:<4} | {gate_str:<34} | {metric_str:<28} | {status_str}")
 
         # 실제 시그널 포착 시 텔레그램 알림 발송
         if eval_res['signal'] is not None and not already_sent:
@@ -580,16 +605,18 @@ def main():
                 state[tf] = eval_res["candle_ts"]
                 save_alert_state(state)
 
-    print("=" * 118)
+    print("=" * 124)
 
-    # 수동 테스트 실행(--force) 시에만: 현재 시각에 마감 확정된 타임프레임(또는 5m 완성봉) 1회 샘플 브리핑
+    # 수동 테스트 실행(--force) 시에만 1회 샘플 브리핑 전송
     if force_send and triggered_count == 0:
-        ref_tf = evaluated_rows[-1][0] if evaluated_rows else "5m"
+        ref_tf = evaluated_rows[-1][0] if evaluated_rows else "15m"
         ref_df = dfs[ref_tf]
         ref_eval = analyze_closed_breakout(ref_df, ref_tf, TIMEFRAMES[ref_tf], htf_info)
         print(f"수동 테스트 모드(--force): [{ref_tf}] {ref_eval['closed_candle_label']} 기준 미니 카드 브리핑을 전송합니다.")
         chart_path = create_breakout_chart(ref_df, ref_tf, ref_eval, current_price)
         caption = build_breakout_message(ref_tf, ref_eval, current_price)
+        print("\n[전송될 미니 카드 메시지 미리보기]")
+        print(caption)
         res = send_telegram_photo(chart_path, caption)
         if res.get("ok"):
             print("✅ 수동 테스트 미니 카드 전송 완료!")
